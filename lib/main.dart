@@ -1,6 +1,212 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:crypto/crypto.dart';
+import 'package:dart_appwrite/dart_appwrite.dart';
 
 Future<dynamic> main(final context) async {
+  final method = (context.req.method ?? 'GET').toString().toUpperCase();
+  context.log('Request method: $method');
+
+  // POST = Chargily webhook callback
+  if (method == 'POST') {
+    return _handleWebhook(context);
+  }
+
+  // GET = Browser redirect (after payment)
+  return _handleRedirect(context);
+}
+
+// ══════════════════════════════════════════════════════════
+// WEBHOOK HANDLER (POST from Chargily)
+// ══════════════════════════════════════════════════════════
+Future<dynamic> _handleWebhook(final context) async {
+  try {
+    context.log('=== Chargily Webhook Handler ===');
+
+    final chargilySecret = Platform.environment['CHARGILY_SECRET_KEY'] ?? '';
+    final chargilySignature = context.req.headers['signature'] ?? '';
+
+    context.log('Secret present: ${chargilySecret.isNotEmpty}');
+    context.log('Signature present: ${chargilySignature.isNotEmpty}');
+
+    if (chargilySecret.isEmpty || chargilySignature.isEmpty) {
+      context.error('Missing secret key or signature header.');
+      return context.res.json({'error': 'Configuration error'}, 400);
+    }
+
+    // Verify HMAC signature
+    final key = utf8.encode(chargilySecret);
+    final bytes = utf8.encode(context.req.bodyRaw);
+    final hmacSha256 = Hmac(sha256, key);
+    final digest = hmacSha256.convert(bytes);
+    final generatedSignature = digest.toString();
+
+    if (generatedSignature != chargilySignature) {
+      context.error('INVALID SIGNATURE');
+      context.error('Expected: $generatedSignature');
+      context.error('Got: $chargilySignature');
+      return context.res.text('INVALID SIGNATURE');
+    }
+
+    context.log('Signature verified successfully.');
+
+    final apiKey = Platform.environment['APPWRITE_API_KEY'] ?? '';
+    if (apiKey.isEmpty) {
+      context.error('APPWRITE_API_KEY environment variable is not set');
+      return context.res.text('FAILURE');
+    }
+
+    final client = Client()
+        .setEndpoint(
+            Platform.environment['APPWRITE_FUNCTION_API_ENDPOINT'] ??
+                'https://backend.ah-mar.app/v1')
+        .setProject(
+            Platform.environment['APPWRITE_FUNCTION_PROJECT_ID'] ??
+                '6966d5030009343737c1')
+        .setKey(apiKey);
+
+    final databases = Databases(client);
+
+    final Map<String, dynamic> body = jsonDecode(context.req.bodyRaw);
+    final String type = body['type']?.toString() ?? '';
+
+    context.log('Event type: $type');
+
+    if (type == 'checkout.paid') {
+      final data = body['data'] as Map<String, dynamic>;
+      final metadata = data['metadata'] as Map<String, dynamic>? ?? {};
+
+      final String userId = metadata['user_id']?.toString() ?? '';
+      final List<String> bookIds =
+          List<String>.from(metadata['book_id'] ?? []);
+      final double amount =
+          (data['amount'] as num?)?.toDouble() ?? 0.0;
+
+      context.log('Processing payment for user: $userId');
+      context.log('Book IDs: $bookIds');
+      context.log('Amount: $amount');
+
+      if (userId.isEmpty || bookIds.isEmpty) {
+        context.error('Missing user_id or book_id in metadata');
+        return context.res.text('FAILURE');
+      }
+
+      final dbId = Platform.environment['DB_ID'] ?? '68b4bcf9001027235773';
+      final transactionsTable =
+          Platform.environment['DB_TRANSACTIONS'] ?? 'transactions';
+      final userLibraryTable =
+          Platform.environment['DB_USER_LIBRARY'] ?? 'user_library_table';
+
+      // --- Create Transaction Record ---
+      try {
+        await databases.createDocument(
+          databaseId: dbId,
+          collectionId: transactionsTable,
+          documentId: ID.unique(),
+          data: {
+            'user_id': userId,
+            'book_id': bookIds,
+            'total_price': amount,
+            'status': 'completed',
+          },
+        );
+        context.log('Transaction record created');
+      } catch (e) {
+        context.error('Failed to create transaction: $e');
+      }
+
+      // --- Update User Library ---
+      try {
+        String? docId;
+        List<String> currentBookIds = [];
+
+        // Try to find library by user_id query
+        final libraryDocs = await databases.listDocuments(
+          databaseId: dbId,
+          collectionId: userLibraryTable,
+          queries: [
+            Query.equal('user_id', userId),
+            Query.limit(1),
+          ],
+        );
+
+        if (libraryDocs.documents.isNotEmpty) {
+          final doc = libraryDocs.documents.first;
+          docId = doc.$id;
+          final List<dynamic> booksData = doc.data['books'] ?? [];
+          for (final book in booksData) {
+            if (book is Map) {
+              final id = book['\$id']?.toString();
+              if (id != null && id.isNotEmpty) currentBookIds.add(id);
+            } else {
+              final id = book.toString();
+              if (id.isNotEmpty) currentBookIds.add(id);
+            }
+          }
+          context.log('Current library (query): ${currentBookIds.length} books');
+        } else {
+          // Fallback: document ID = user ID
+          try {
+            final doc = await databases.getDocument(
+              databaseId: dbId,
+              collectionId: userLibraryTable,
+              documentId: userId,
+            );
+            docId = doc.$id;
+            final List<dynamic> booksData = doc.data['books'] ?? [];
+            for (final book in booksData) {
+              if (book is Map) {
+                final id = book['\$id']?.toString();
+                if (id != null && id.isNotEmpty) currentBookIds.add(id);
+              } else {
+                final id = book.toString();
+                if (id.isNotEmpty) currentBookIds.add(id);
+              }
+            }
+            context.log('Current library (docId): ${currentBookIds.length} books');
+          } catch (e2) {
+            context.error('Library not found for user $userId: $e2');
+            return context.res.text('FAILURE');
+          }
+        }
+
+        // Add new books (avoid duplicates)
+        final List<String> updatedLibrary = List<String>.from(currentBookIds);
+        for (final id in bookIds) {
+          if (!updatedLibrary.contains(id)) {
+            updatedLibrary.add(id);
+          }
+        }
+
+        context.log('Updating library: $currentBookIds -> $updatedLibrary');
+
+        await databases.updateDocument(
+          databaseId: dbId,
+          collectionId: userLibraryTable,
+          documentId: docId!,
+          data: {'books': updatedLibrary},
+        );
+        context.log('User library updated with ${updatedLibrary.length} books');
+      } catch (e) {
+        context.error('Failed to update library: $e');
+        return context.res.text('FAILURE');
+      }
+    } else {
+      context.log('Ignoring event type: $type');
+    }
+
+    return context.res.text('SUCCESS');
+  } catch (e) {
+    context.error('Webhook error: $e');
+    return context.res.text('FAILURE');
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+// REDIRECT HANDLER (GET from browser after payment)
+// ══════════════════════════════════════════════════════════
+Future<dynamic> _handleRedirect(final context) async {
   // Get status from query parameters
   final query = context.req.query as Map<String, dynamic>? ?? {};
   final status = query['status']?.toString() ?? 'cancel';

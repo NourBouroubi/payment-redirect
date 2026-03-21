@@ -1,7 +1,11 @@
 name: payment_redirect
-description: Redirects payment callbacks to app deep links
-version: 1.0.0
+description: Handles Chargily webhook + redirects payment callbacks to app deep links
+version: 1.0.1
 publish_to: none
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  dart_appwrite: ^14.0.0
+  crypto: ^3.0.7
