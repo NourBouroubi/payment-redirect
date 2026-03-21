@@ -94,7 +94,7 @@ Future<dynamic> _handleWebhook(final context) async {
 
       final dbId = Platform.environment['DB_ID'] ?? '68b4bcf9001027235773';
       final transactionsTable =
-          Platform.environment['DB_TRANSACTIONS'] ?? 'transactions';
+          Platform.environment['DB_TRANSACTIONS'] ?? 'transactions_table';
       final userLibraryTable =
           Platform.environment['DB_USER_LIBRARY'] ?? 'user_library_table';
 
