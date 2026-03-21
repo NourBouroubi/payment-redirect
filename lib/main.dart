@@ -117,11 +117,21 @@ Future<dynamic> _handleWebhook(final context) async {
       }
 
       // --- Update User Library ---
-      try {
-        String? docId;
-        List<String> currentBookIds = [];
+      // Use the library list from metadata (snapshot from checkout time)
+      // and add the new books to it — same approach as the original working code
+      final List<String> existingLibrary =
+          List<String>.from(metadata['library'] ?? []);
+      final List<String> newLibrary = List<String>.from(existingLibrary);
+      for (final id in bookIds) {
+        if (!newLibrary.contains(id)) {
+          newLibrary.add(id);
+        }
+      }
 
-        // Try to find library by user_id query
+      context.log('Library update: $existingLibrary -> $newLibrary');
+
+      try {
+        // Try to find library doc
         final libraryDocs = await databases.listDocuments(
           databaseId: dbId,
           collectionId: userLibraryTable,
@@ -131,63 +141,20 @@ Future<dynamic> _handleWebhook(final context) async {
           ],
         );
 
+        String docId;
         if (libraryDocs.documents.isNotEmpty) {
-          final doc = libraryDocs.documents.first;
-          docId = doc.$id;
-          final List<dynamic> booksData = doc.data['books'] ?? [];
-          for (final book in booksData) {
-            if (book is Map) {
-              final id = book['\$id']?.toString();
-              if (id != null && id.isNotEmpty) currentBookIds.add(id);
-            } else {
-              final id = book.toString();
-              if (id.isNotEmpty) currentBookIds.add(id);
-            }
-          }
-          context.log('Current library (query): ${currentBookIds.length} books');
+          docId = libraryDocs.documents.first.$id;
         } else {
-          // Fallback: document ID = user ID
-          try {
-            final doc = await databases.getDocument(
-              databaseId: dbId,
-              collectionId: userLibraryTable,
-              documentId: userId,
-            );
-            docId = doc.$id;
-            final List<dynamic> booksData = doc.data['books'] ?? [];
-            for (final book in booksData) {
-              if (book is Map) {
-                final id = book['\$id']?.toString();
-                if (id != null && id.isNotEmpty) currentBookIds.add(id);
-              } else {
-                final id = book.toString();
-                if (id.isNotEmpty) currentBookIds.add(id);
-              }
-            }
-            context.log('Current library (docId): ${currentBookIds.length} books');
-          } catch (e2) {
-            context.error('Library not found for user $userId: $e2');
-            return context.res.text('FAILURE');
-          }
+          docId = userId; // fallback: doc ID = user ID
         }
-
-        // Add new books (avoid duplicates)
-        final List<String> updatedLibrary = List<String>.from(currentBookIds);
-        for (final id in bookIds) {
-          if (!updatedLibrary.contains(id)) {
-            updatedLibrary.add(id);
-          }
-        }
-
-        context.log('Updating library: $currentBookIds -> $updatedLibrary');
 
         await databases.updateDocument(
           databaseId: dbId,
           collectionId: userLibraryTable,
-          documentId: docId!,
-          data: {'books': updatedLibrary},
+          documentId: docId,
+          data: {'books': newLibrary},
         );
-        context.log('User library updated with ${updatedLibrary.length} books');
+        context.log('User library updated with ${newLibrary.length} books');
       } catch (e) {
         context.error('Failed to update library: $e');
         return context.res.text('FAILURE');
