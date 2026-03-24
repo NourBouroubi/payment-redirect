@@ -117,36 +117,47 @@ Future<dynamic> _handleWebhook(final context) async {
       }
 
       // --- Update User Library ---
-      // Use the library list from metadata (snapshot from checkout time)
-      // and add the new books to it — same approach as the original working code
-      final List<String> existingLibrary =
-          List<String>.from(metadata['library'] ?? []);
-      final List<String> newLibrary = List<String>.from(existingLibrary);
-      for (final id in bookIds) {
-        if (!newLibrary.contains(id)) {
-          newLibrary.add(id);
-        }
-      }
-
-      context.log('Library update: $existingLibrary -> $newLibrary');
-
+      // Read the CURRENT library from the database (not metadata snapshot)
+      // to avoid overwriting books added since checkout was created
       try {
-        // Try to find library doc
         final libraryDocs = await databases.listDocuments(
           databaseId: dbId,
           collectionId: userLibraryTable,
           queries: [
             Query.equal('user_id', userId),
             Query.limit(1),
+            Query.select(['books.\$id']),
           ],
         );
 
         String docId;
+        List<String> existingLibrary = [];
+
         if (libraryDocs.documents.isNotEmpty) {
           docId = libraryDocs.documents.first.$id;
+          // Extract book IDs from relationship field
+          final booksData = libraryDocs.documents.first.data['books'];
+          if (booksData is List) {
+            for (final item in booksData) {
+              if (item is Map && item['\$id'] != null) {
+                existingLibrary.add(item['\$id'].toString());
+              } else if (item is String) {
+                existingLibrary.add(item);
+              }
+            }
+          }
         } else {
-          docId = userId; // fallback: doc ID = user ID
+          docId = userId;
         }
+
+        final List<String> newLibrary = List<String>.from(existingLibrary);
+        for (final id in bookIds) {
+          if (!newLibrary.contains(id)) {
+            newLibrary.add(id);
+          }
+        }
+
+        context.log('Library update: $existingLibrary -> $newLibrary');
 
         await databases.updateDocument(
           databaseId: dbId,
