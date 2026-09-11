@@ -107,7 +107,10 @@ Future<dynamic> _handleWebhook(final context) async {
           data: {
             'user_id': userId,
             'book_id': bookIds,
-            'total_price': amount,
+            // The column is an integer and Chargily sends 530.0, which the
+            // structure check refuses outright. Rounded here rather than at
+            // the parse above, so the logged amount stays what was received.
+            'total_price': amount.round(),
             'status': 'completed',
           },
         );
