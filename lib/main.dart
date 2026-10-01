@@ -98,6 +98,31 @@ Future<dynamic> _handleWebhook(final context) async {
       final userLibraryTable =
           Platform.environment['DB_USER_LIBRARY'] ?? 'user_library_table';
 
+      // --- Refuse a payment below what the books cost ---
+      final expected = await _expectedAmount(context, databases, dbId,
+          bookIds, metadata['promo_code_id']?.toString() ?? '');
+      if (expected != null && amount + 1 < expected) {
+        context.error(
+            'UNDERPAID: $userId paid $amount for $bookIds, expected $expected');
+        try {
+          await databases.createDocument(
+            databaseId: dbId,
+            collectionId: transactionsTable,
+            documentId: ID.unique(),
+            data: {
+              'user_id': userId,
+              'book_id': bookIds,
+              'total_price': amount.round(),
+              'status': 'underpaid',
+            },
+          );
+        } catch (e) {
+          context.error('Failed to record underpaid transaction: $e');
+        }
+        // SUCCESS so Chargily stops retrying; the books are not granted.
+        return context.res.text('SUCCESS');
+      }
+
       // --- Create Transaction Record ---
       try {
         await databases.createDocument(
@@ -334,4 +359,77 @@ Future<dynamic> _handleRedirect(final context) async {
     200,
     {'Content-Type': 'text/html; charset=utf-8'},
   );
+}
+
+/// What the books in [bookIds] cost, less the promo code the buyer used.
+///
+/// Chargily vouches for the amount it charged; the books' prices come from
+/// the database. The checkout itself was built from a total the buyer's
+/// device sent, so a paid amount below this is a tampered request.
+///
+/// The promo's usage counter and expiry are deliberately NOT checked: the app
+/// increments the counter as soon as the checkout is created, before the
+/// buyer has paid, so a legitimate last use would otherwise be refused here.
+/// Returns null when the prices cannot be read, so a database hiccup never
+/// costs a genuine buyer their book.
+Future<int?> _expectedAmount(
+  dynamic context,
+  Databases databases,
+  String dbId,
+  List<String> bookIds,
+  String promoId,
+) async {
+  try {
+    final booksTable =
+        Platform.environment['DB_STORE_BOOKS'] ?? 'store_books_table';
+    Map<String, dynamic>? promo;
+    if (promoId.isNotEmpty) {
+      try {
+        promo = (await databases.getDocument(
+          databaseId: dbId,
+          collectionId: Platform.environment['DB_PROMO_CODES'] ?? 'promo_codes',
+          documentId: promoId,
+        ))
+            .data;
+      } catch (e) {
+        context.log('Promo $promoId not readable: $e');
+      }
+    }
+
+    List<String> applicable = [];
+    final raw = promo?['applicable_books'];
+    if (raw is List) {
+      applicable = raw.map((e) => e.toString()).toList();
+    } else if (raw is String && raw.isNotEmpty && raw != '[]') {
+      applicable = raw
+          .replaceAll(RegExp(r'[\[\]"]'), '')
+          .split(',')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    }
+
+    var total = 0;
+    for (final id in bookIds.toSet()) {
+      final book = await databases.getDocument(
+        databaseId: dbId,
+        collectionId: booksTable,
+        documentId: id,
+      );
+      final price = (book.data['price'] as num?)?.round() ?? 0;
+      var discount = 0;
+      if (promo != null && (applicable.isEmpty || applicable.contains(id))) {
+        final value = (promo['discount_value'] as num?)?.round() ?? 0;
+        // Same rule as PromoCodeModel.calculateDiscount in the app.
+        discount = (promo['discount_type'] ?? 'percentage') == 'percentage'
+            ? (price * value / 100).round()
+            : value.clamp(0, price);
+      }
+      total += price - discount;
+    }
+    return total;
+  } catch (e) {
+    context.error('Could not compute the expected amount: $e');
+    return null;
+  }
 }
