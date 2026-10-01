@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:dart_appwrite/dart_appwrite.dart';
+import 'package:dart_appwrite/enums.dart' show ExecutionMethod;
 
 Future<dynamic> main(final context) async {
   final method = (context.req.method ?? 'GET').toString().toUpperCase();
@@ -92,6 +93,21 @@ Future<dynamic> _handleWebhook(final context) async {
         return context.res.text('FAILURE');
       }
 
+      // A paid gift belongs to its recipient, not to the payer. The gift
+      // logic (and the Brevo/notify settings it needs) lives in the
+      // "Chargily webhook" function, so hand it the untouched event with
+      // Chargily's signature; it re-verifies before acting.
+      final String giftId = metadata['gift_id']?.toString() ?? '';
+      if (giftId.isNotEmpty) {
+        return _forwardGift(context, chargilySignature, giftId);
+      }
+
+      // Chargily can deliver the same event more than once. The checkout id
+      // becomes the transaction's document id, so a repeat is refused by the
+      // database instead of being counted as a second sale.
+      final String checkoutId = data['id']?.toString() ?? '';
+      final String transactionId = _transactionId(checkoutId);
+
       final dbId = Platform.environment['DB_ID'] ?? '68b4bcf9001027235773';
       final transactionsTable =
           Platform.environment['DB_TRANSACTIONS'] ?? 'transactions_table';
@@ -108,7 +124,7 @@ Future<dynamic> _handleWebhook(final context) async {
           await databases.createDocument(
             databaseId: dbId,
             collectionId: transactionsTable,
-            documentId: ID.unique(),
+            documentId: transactionId,
             data: {
               'user_id': userId,
               'book_id': bookIds,
@@ -128,7 +144,7 @@ Future<dynamic> _handleWebhook(final context) async {
         await databases.createDocument(
           databaseId: dbId,
           collectionId: transactionsTable,
-          documentId: ID.unique(),
+          documentId: transactionId,
           data: {
             'user_id': userId,
             'book_id': bookIds,
@@ -140,6 +156,12 @@ Future<dynamic> _handleWebhook(final context) async {
           },
         );
         context.log('Transaction record created');
+      } on AppwriteException catch (e) {
+        if (e.code == 409) {
+          context.log('Checkout $checkoutId already recorded; repeat delivery');
+        } else {
+          context.error('Failed to create transaction: $e');
+        }
       } catch (e) {
         context.error('Failed to create transaction: $e');
       }
@@ -431,5 +453,52 @@ Future<int?> _expectedAmount(
   } catch (e) {
     context.error('Could not compute the expected amount: $e');
     return null;
+  }
+}
+
+/// A document id derived from the Chargily checkout id, or a fresh one when
+/// the event carries none. Appwrite ids allow a-z, 0-9, '.', '-', '_', at
+/// most 36 characters, and must not start with a special character.
+String _transactionId(String checkoutId) {
+  final cleaned = checkoutId.toLowerCase().replaceAll(RegExp(r'[^a-z0-9._-]'), '');
+  if (cleaned.isEmpty || !RegExp(r'^[a-z0-9]').hasMatch(cleaned)) {
+    return ID.unique();
+  }
+  final id = 'chk_$cleaned';
+  return id.length > 36 ? id.substring(0, 36) : id;
+}
+
+/// Passes a gift payment to the function that knows how to settle gifts.
+///
+/// Returns SUCCESS only when that function did, so Chargily retries anything
+/// that did not land rather than the gift silently staying unpaid.
+Future<dynamic> _forwardGift(
+  final context,
+  String signature,
+  String giftId,
+) async {
+  final giftFunctionId =
+      Platform.environment['GIFT_WEBHOOK_FUNCTION_ID'] ?? '68ceb9a3003b582c9099';
+  try {
+    // That function's execute permission is "any", so no key is needed.
+    final guest = Client()
+        .setEndpoint(Platform.environment['APPWRITE_FUNCTION_API_ENDPOINT'] ??
+            'https://backend.ah-mar.app/v1')
+        .setProject(Platform.environment['APPWRITE_FUNCTION_PROJECT_ID'] ??
+            '6966d5030009343737c1');
+    final execution = await Functions(guest).createExecution(
+      functionId: giftFunctionId,
+      body: context.req.bodyRaw,
+      xasync: false,
+      path: '/',
+      method: ExecutionMethod.pOST,
+      headers: {'signature': signature, 'content-type': 'application/json'},
+    );
+    final reply = execution.responseBody.trim();
+    context.log('Gift $giftId forwarded: ${execution.responseStatusCode} $reply');
+    return context.res.text(reply == 'SUCCESS' ? 'SUCCESS' : 'FAILURE');
+  } catch (e) {
+    context.error('Could not forward gift $giftId: $e');
+    return context.res.text('FAILURE');
   }
 }
