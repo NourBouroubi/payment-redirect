@@ -9,6 +9,12 @@ Future<dynamic> main(final context) async {
   final method = (context.req.method ?? 'GET').toString().toUpperCase();
   context.log('Request method: $method');
 
+  // POST from Paddle (card payments on store.ah-mar.app)
+  if (method == 'POST' &&
+      (context.req.headers['paddle-signature'] ?? '').toString().isNotEmpty) {
+    return _handlePaddle(context);
+  }
+
   // POST = Chargily webhook callback
   if (method == 'POST') {
     return _handleWebhook(context);
@@ -500,5 +506,139 @@ Future<dynamic> _forwardGift(
   } catch (e) {
     context.error('Could not forward gift $giftId: $e');
     return context.res.text('FAILURE');
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+// PADDLE (POST from Paddle Billing, store card payments)
+// ══════════════════════════════════════════════════════════
+
+/// Settles a completed Paddle transaction created by store-checkout.
+///
+/// Authenticity: the `Paddle-Signature` header is `ts=<unix>;h1=<hex>`, an
+/// HMAC-SHA256 of `<ts>:<raw body>` under the notification destination's
+/// secret. Only store-checkout (holding the API key) creates these
+/// transactions and sets their price, so a valid signature on a completed
+/// transaction is the whole check.
+Future<dynamic> _handlePaddle(final context) async {
+  final secret = Platform.environment['PADDLE_WEBHOOK_SECRET'] ?? '';
+  final header = context.req.headers['paddle-signature'].toString();
+  final raw = context.req.bodyRaw.toString();
+  if (secret.isEmpty) {
+    context.error('PADDLE_WEBHOOK_SECRET is not set');
+    return context.res.text('FAILURE', 500);
+  }
+
+  String ts = '';
+  final h1s = <String>[];
+  for (final part in header.split(';')) {
+    final kv = part.split('=');
+    if (kv.length != 2) continue;
+    if (kv[0] == 'ts') ts = kv[1];
+    if (kv[0] == 'h1') h1s.add(kv[1]);
+  }
+  final expected =
+      Hmac(sha256, utf8.encode(secret)).convert(utf8.encode('$ts:$raw')).toString();
+  final age = DateTime.now().millisecondsSinceEpoch ~/ 1000 - (int.tryParse(ts) ?? 0);
+  if (!h1s.contains(expected) || age.abs() > 3600) {
+    context.error('Paddle: invalid signature (age ${age}s)');
+    return context.res.text('INVALID SIGNATURE', 401);
+  }
+
+  final body = jsonDecode(raw) as Map<String, dynamic>;
+  final type = body['event_type']?.toString() ?? '';
+  if (type != 'transaction.completed') {
+    context.log('Paddle: ignoring $type');
+    return context.res.text('OK');
+  }
+
+  final data = body['data'] as Map<String, dynamic>;
+  final custom = (data['custom_data'] as Map?)?.cast<String, dynamic>() ?? {};
+  final userId = custom['user_id']?.toString() ?? '';
+  final bookIds = List<String>.from(custom['book_id'] ?? const []);
+  final txnId = data['id']?.toString() ?? '';
+  if (userId.isEmpty || bookIds.isEmpty || custom['source'] != 'store') {
+    context.error('Paddle $txnId: not a store transaction ($custom)');
+    return context.res.text('OK');
+  }
+
+  final client = Client()
+      .setEndpoint(Platform.environment['APPWRITE_FUNCTION_API_ENDPOINT'] ??
+          'https://backend.ah-mar.app/v1')
+      .setProject(Platform.environment['APPWRITE_FUNCTION_PROJECT_ID'] ??
+          '6966d5030009343737c1')
+      .setKey(Platform.environment['APPWRITE_API_KEY'] ?? '');
+  final databases = Databases(client);
+  final dbId = Platform.environment['DB_ID'] ?? '68b4bcf9001027235773';
+  final libraryTable =
+      Platform.environment['DB_USER_LIBRARY'] ?? 'user_library_table';
+  final transactionsTable =
+      Platform.environment['DB_TRANSACTIONS'] ?? 'transactions_table';
+
+  // The receipt, once per Paddle transaction. total_price is kept in dinars
+  // like every other row, so sales figures stay in one currency.
+  try {
+    var dzd = 0;
+    for (final id in bookIds.toSet()) {
+      final book = await databases.getDocument(
+          databaseId: dbId,
+          collectionId: Platform.environment['DB_STORE_BOOKS'] ?? 'store_books_table',
+          documentId: id);
+      dzd += (book.data['price'] as num?)?.round() ?? 0;
+    }
+    await databases.createDocument(
+      databaseId: dbId,
+      collectionId: transactionsTable,
+      // txn_<26 chars> -> pdl_<26 chars>: 30 characters, under the 36 limit.
+      documentId: 'pdl_${txnId.toLowerCase().replaceFirst('txn_', '').replaceAll(RegExp(r'[^a-z0-9]'), '')}',
+      data: {
+        'user_id': userId,
+        'book_id': bookIds,
+        'total_price': dzd,
+        'status': 'completed',
+      },
+    );
+  } on AppwriteException catch (e) {
+    if (e.code == 409) {
+      context.log('Paddle $txnId already recorded; repeat delivery');
+    } else {
+      context.error('Paddle $txnId: transaction record failed: $e');
+    }
+  } catch (e) {
+    context.error('Paddle $txnId: transaction record failed: $e');
+  }
+
+  try {
+    final found = await databases.listDocuments(
+      databaseId: dbId,
+      collectionId: libraryTable,
+      queries: [
+        Query.equal('user_id', userId),
+        Query.limit(1),
+        Query.select(['\$id', 'books.\$id']),
+      ],
+    );
+    final docId =
+        found.documents.isNotEmpty ? found.documents.first.$id : userId;
+    final owned = <String>[];
+    if (found.documents.isNotEmpty) {
+      for (final item in (found.documents.first.data['books'] as List? ?? const [])) {
+        if (item is Map && item['\$id'] != null) owned.add(item['\$id'].toString());
+        if (item is String) owned.add(item);
+      }
+    }
+    final updated = {...owned, ...bookIds}.toList();
+    await databases.updateDocument(
+      databaseId: dbId,
+      collectionId: libraryTable,
+      documentId: docId,
+      data: {'books': updated},
+    );
+    context.log('Paddle $txnId: library of $userId now ${updated.length} books');
+    return context.res.text('OK');
+  } catch (e) {
+    // Non-2xx makes Paddle retry, which is what a missed grant needs.
+    context.error('Paddle $txnId: library update failed: $e');
+    return context.res.text('FAILURE', 500);
   }
 }
