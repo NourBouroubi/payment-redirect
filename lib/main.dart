@@ -168,26 +168,26 @@ Future<dynamic> _handleRedirect(final context, [String? knownStatus]) async {
   switch (status) {
     case 'success':
       deepLink = 'melonbook://payment-success';
-      title = 'Payment Successful!';
+      title = 'تم الدفع بنجاح';
       icon = '✓';
       color = '#4CAF50';
       break;
     case 'failure':
       deepLink = 'melonbook://payment-failure';
-      title = 'Payment Failed';
+      title = 'لم يكتمل الدفع';
       icon = '✕';
       color = '#F44336';
       break;
     default:
       deepLink = 'melonbook://payment-cancel';
-      title = 'Payment Cancelled';
+      title = 'تم إلغاء الدفع';
       icon = '←';
       color = '#FF9800';
   }
 
   final html = '''
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
@@ -272,10 +272,10 @@ Future<dynamic> _handleRedirect(final context, [String? knownStatus]) async {
     <div class="card">
         <div class="icon-circle">$icon</div>
         <h1>$title</h1>
-        <p>Returning to Melon Book...</p>
+        <p>جارٍ العودة إلى أحمر...</p>
         <div class="loader"></div>
-        <a href="$deepLink" class="btn">Open App</a>
-        <p class="hint">Tap the button if not redirected</p>
+        <a href="$deepLink" class="btn">فتح التطبيق</a>
+        <p class="hint">اضغط الزر إذا لم تنتقل تلقائياً</p>
     </div>
     <script>
         // Immediate redirect attempt
@@ -704,9 +704,8 @@ Future<dynamic> _handlePaddle(final context) async {
 
 /// Settles a Slick-Pay invoice when its webhook arrives.
 ///
-/// Slick-Pay does not sign its webhooks the way Chargily does: the
-/// "signature" is a value we chose when creating the invoice, and the body's
-/// format is not documented. So the webhook only says "look at invoice N";
+/// Slick-Pay does not sign its webhooks (none seen on a real payment,
+/// 2026-10-23); the body is the invoice as GET users/invoices/{id} returns it. So the webhook only says "look at invoice N";
 /// whether N is paid, how much, and for whom all come from asking Slick-Pay
 /// about the invoice with our own key. A forged webhook can at most make us
 /// look at an invoice, which settles nothing unless it really was paid.
@@ -720,10 +719,10 @@ Future<dynamic> _handleSlickPayWebhook(final context) async {
   } catch (_) {
     // Possibly form-encoded; the query fallback below still applies.
   }
-  // The format is undocumented: keep the shape in the log until it is
-  // known. Slick-Pay never sees the card, so there is no card data here.
-  context.log('Headers: ${(context.req.headers as Map).keys.toList()}');
-  context.log('Body: ${raw.length > 2000 ? raw.substring(0, 2000) : raw}');
+  // The body is the invoice itself, card transaction included (cardholder
+  // name, masked card number, payer IP), so it is not logged whole.
+  context.log('Slick-Pay webhook: invoice ${body['id']}, '
+      'completed ${body['completed']}, status ${body['status']}');
 
   final signature = _slickPaySignature(context, raw, body);
   if (signature == false) {
@@ -753,10 +752,9 @@ Future<dynamic> _handleSlickPayWebhook(final context) async {
   // our secret.
   var meta = invoice.meta;
   if (meta.isEmpty && signature == true) {
-    meta = _asMap(body['webhook_meta_data'] ??
-        body['meta_data'] ??
-        body['metadata'] ??
-        (body['data'] is Map ? (body['data'] as Map)['webhook_meta_data'] : null));
+    meta = _asMap(_asMap(body['meta_data'])['webhook_meta_data'] ??
+        body['webhook_meta_data'] ??
+        body['metadata']);
   }
   final userId = meta['user_id']?.toString() ?? '';
   final bookIds = _asStringList(meta['book_id']);
@@ -1011,9 +1009,11 @@ Future<_SlickPayInvoice?> _fetchSlickPayInvoice(
     request.headers.set('Authorization', 'Bearer $publicKey');
     final response = await request.close().timeout(const Duration(seconds: 15));
     final text = await response.transform(utf8.decoder).join();
-    context.log('Slick-Pay invoice $invoiceId: HTTP ${response.statusCode} '
-        '${text.length > 1500 ? text.substring(0, 1500) : text}');
-    if (response.statusCode != 200) return null;
+    if (response.statusCode != 200) {
+      context.error('Slick-Pay invoice $invoiceId: HTTP ${response.statusCode} '
+          '${text.length > 500 ? text.substring(0, 500) : text}');
+      return null;
+    }
 
     final reply = _asMap(jsonDecode(text));
     final data = _asMap(reply['data']);
@@ -1025,10 +1025,12 @@ Future<_SlickPayInvoice?> _fetchSlickPayInvoice(
     final amount = double.tryParse(
             (data['amount'] ?? reply['amount'] ?? '').toString()) ??
         0.0;
-    final meta = _asMap(data['webhook_meta_data'] ??
-        reply['webhook_meta_data'] ??
-        data['meta_data'] ??
-        data['metadata']);
+    // What we sent as webhook_meta_data comes back inside meta_data.
+    final meta = _asMap(_asMap(data['meta_data'])['webhook_meta_data'] ??
+        data['webhook_meta_data'] ??
+        reply['webhook_meta_data']);
+    context.log('Slick-Pay invoice $invoiceId: completed $completed, '
+        'amount $amount, status ${data['status']}');
     return _SlickPayInvoice(completed, amount, meta);
   } catch (e) {
     context.error('Slick-Pay invoice $invoiceId: could not read: $e');
